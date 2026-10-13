@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+"""
+A minimal static blog generator with sections.
+
+What it does, top to bottom:
+  1. Reads every .md file under CONTENT_DIR/<section>/ (macro, micro, art, burgundy, …).
+  2. Splits off the YAML front matter (the block between the leading --- fences).
+  3. Renders the markdown body to HTML.
+  4. Writes a page per post           -> dist/<section>/<slug>/index.html
+  5. Writes a page per section        -> dist/<section>/index.html
+       - macro:   a date-sorted list of essays
+       - micro:   a social-media-style feed (title, date, content inline)
+       - art:     a visual gallery grid
+       - burgundy: a static image gallery (no post pages)
+  6. Writes a landing page            -> dist/index.html
+  7. Copies everything in static/     -> dist/static/
+  8. Writes dist/CNAME                -> for GitHub Pages custom domain
+
+Run it:  python build.py
+Deps:    pip install markdown pyyaml
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import html
+import re
+import shutil
+import urllib.parse
+from pathlib import Path
+
+import markdown
+import yaml
+
+# ---------------------------------------------------------------------------
+# Config — edit these.
+# ---------------------------------------------------------------------------
+SITE_TITLE = "ray of sunshine"
+CUSTOM_DOMAIN = ""  # set to your domain for GitHub Pages CNAME, or leave empty
+
+# Sections. Each section is a content/<key>/ folder rendered with one of three
+# layouts ("kind"): "list" (essays), "feed" (snapshots), "gallery" (objects).
+SECTIONS = [
+    {
+        "key": "macro",
+        "label": "macro",
+        "kind": "list",
+    },
+    {
+        "key": "micro",
+        "label": "micro",
+        "kind": "feed",
+    },
+    {
+        "key": "art",
+        "label": "art",
+        "kind": "gallery",
+    },
+    {
+        "key": "burgundy",
+        "label": "burgundy",
+        "kind": "images",
+    },
+]
+
+SECTION_ICONS = {
+    "macro": "macro.png",
+    "micro": "micro.png",
+    "art": "art.png",
+    "burgundy": "burgundy.png",
+}
+
+ROOT = Path(__file__).parent
+CONTENT_DIR = ROOT / "content"
+STATIC_DIR = ROOT / "static"
+OUTPUT_DIR = ROOT / "dist"
+
+# Markdown extensions: fenced code blocks, tables, footnotes, smart typography.
+MD_EXTENSIONS = ["fenced_code", "tables", "footnotes", "smarty", "toc"]
+
+# ---------------------------------------------------------------------------
+# Templates — plain str.format(). Edit the HTML/structure freely.
+# @@ROOT@@ inside rendered markdown bodies is replaced with the page's relative
+# root at render time, so embedded images resolve from any depth.
+# ---------------------------------------------------------------------------
+BASE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,100..900;1,100..900&display=swap" rel="stylesheet">
+  <link rel="icon" href="{root}static/favicon.png" type="image/png">
+  <link rel="stylesheet" href="{root}static/style.css">
+</head>
+<body>
+  <div class="layout">
+{sidebar}    <div class="main-col">
+      <main>
+{body}
+      </main>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+SIDEBAR = """    <nav class="site-nav" aria-label="Sections">
+      <a class="site-title" href="{root}">{site_title}</a>
+      <ul class="nav-list">
+{items}
+      </ul>
+    </nav>
+"""
+
+NAV_ITEM = """        <li><a class="nav-link{active}" href="{root}{key}/"{current}>{label}</a></li>"""
+
+POST_BODY = """    <div class="page-layout{layout_class}">
+{toc}      <article class="post{post_class}">
+      <p class="post-meta"><time datetime="{iso}">{date}</time></p>
+      <h1>{title}</h1>
+{content}
+      </article>
+    </div>
+    <p class="back"><a href="{root}{section}/">&larr; {section_label}</a></p>
+"""
+
+LIST_ITEM = """          <li>
+            <time datetime="{iso}">{date}</time>
+            <a href="{root}{section}/{slug}/">{title}</a>
+          </li>"""
+
+LIST_BODY = """    <div class="page-layout">
+      <div class="content">
+        <h1 class="section-title">{label}</h1>
+        <ul class="post-list">
+{items}
+        </ul>
+      </div>
+    </div>
+"""
+
+FEED_ITEM = """          <article class="feed-item">
+            <header class="feed-item-head">
+              <time datetime="{iso}">{date}</time>
+              <h2 class="feed-item-title"><a href="{root}{section}/{slug}/">{title}</a></h2>
+            </header>
+            <div class="feed-item-body post">
+{content}
+            </div>
+          </article>"""
+
+FEED_BODY = """    <div class="page-layout">
+      <div class="content">
+        <h1 class="section-title">{label}</h1>
+        <div class="feed">
+{items}
+        </div>
+      </div>
+    </div>
+"""
+
+GALLERY_CARD = """          <li class="gallery-card">
+            <a href="{root}{section}/{slug}/">
+              {media}
+              <span class="gallery-card-title">{title}</span>
+            </a>
+          </li>"""
+
+GALLERY_BODY = """    <div class="page-layout">
+      <div class="content content-wide">
+        <h1 class="section-title">{label}</h1>
+        <ul class="gallery">
+{cards}
+        </ul>
+      </div>
+    </div>
+"""
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
+
+STATIC_GALLERY_ITEM = """          <li class="gallery-card">
+            <span class="gallery-card-media">
+              <img src="{src}" alt="" loading="lazy">
+            </span>
+          </li>"""
+
+STATIC_GALLERY_BODY = """    <div class="page-layout">
+      <div class="content content-wide">
+        <h1 class="section-title">{label}</h1>
+        <ul class="gallery">
+{items}
+        </ul>
+      </div>
+    </div>
+"""
+
+LANDING_BODY = """    <div class="page-layout">
+      <div class="content post landing-content">
+{intro}
+{sections}
+      </div>
+    </div>
+"""
+
+LANDING_SECTION_ICON = """          <a class="landing-section" href="{root}{key}/">
+            <div class="landing-section-media">
+              <img class="landing-section-icon" src="{root}static/{icon}" alt="" loading="lazy">
+            </div>
+            <span class="landing-section-label">{label}</span>
+          </a>"""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+FRONT_MATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+LIST_LINE_RE = re.compile(r"^( +)([-+*]|\d+\.) ")
+HEADING_RE = re.compile(r"(<h([1-6])[^>]*>)(.*?)(</h\2>)", re.DOTALL | re.IGNORECASE)
+WIKILINK_IMG_RE = re.compile(r"!\[\[([^\]]+)\]\]")
+FIRST_IMG_RE = re.compile(r'<img[^>]+src="([^"]+)"')
+HEX_COLOR_RE = re.compile(r"(?<![/#\w])(#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3}))\b")
+CODE_CHUNK_RE = re.compile(r"(```.*?```|~~~.*?~~~|`[^`]+`)", re.DOTALL)
+
+
+def content_image_src(name: str) -> str:
+    """Relative (token) src for an image in content/img/."""
+    path = name if name.startswith("img/") else f"img/{name}"
+    return "@@ROOT@@" + urllib.parse.quote(path, safe="/")
+
+
+def convert_wikilinks(raw: str) -> str:
+    """Convert Obsidian ![[file.jpg|width]] embeds into <img> tags.
+
+    Images live in content/img/ (copied to dist/img/). The src uses an @@ROOT@@
+    token so it resolves correctly from any page depth.
+    """
+
+    def repl(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        parts = [p.strip() for p in inner.split("|")]
+        name = parts[0]
+        attr = ""
+        if len(parts) > 1 and parts[1].isdigit():
+            attr = f' width="{parts[1]}"'
+        src = content_image_src(name)
+        alt = html.escape(Path(name).name.rsplit(".", 1)[0])
+        return f'<img src="{src}" alt="{alt}"{attr} loading="lazy">'
+
+    return WIKILINK_IMG_RE.sub(repl, raw)
+
+
+def hex_is_white(hex_color: str) -> bool:
+    """True for white / near-white swatches that need a border on a light page."""
+    digits = hex_color[1:]
+    if len(digits) == 3:
+        digits = "".join(ch * 2 for ch in digits)
+    r, g, b = (int(digits[i : i + 2], 16) for i in (0, 2, 4))
+    return r >= 240 and g >= 240 and b >= 240
+
+
+def convert_hex_swatches(raw: str) -> str:
+    """Turn #rrggbb / #rgb in prose into inline color squares."""
+
+    def swatch(match: re.Match[str]) -> str:
+        color = match.group(1)
+        cls = "color-swatch"
+        if hex_is_white(color):
+            cls += " color-swatch-light"
+        safe = html.escape(color, quote=True)
+        return (
+            f'<span class="{cls}" style="background-color:{safe}" '
+            f'title="{safe}" role="img" aria-label="{safe}"></span>'
+        )
+
+    parts = CODE_CHUNK_RE.split(raw)
+    return "".join(
+        part if i % 2 else HEX_COLOR_RE.sub(swatch, part)
+        for i, part in enumerate(parts)
+    )
+
+
+def extract_sidenotes(raw: str) -> tuple[str, list[str]]:
+    """Pull Pandoc-style ^[sidenote] markers out before markdown runs.
+
+    Notes can contain nested brackets (markdown links: [text](url)), so this
+    walks the string and matches the closing ] by bracket depth.
+    """
+    notes: list[str] = []
+    out: list[str] = []
+    i = 0
+    while i < len(raw):
+        if raw.startswith("^[", i):
+            depth = 1
+            j = i + 2
+            while j < len(raw) and depth:
+                if raw[j] == "[":
+                    depth += 1
+                elif raw[j] == "]":
+                    depth -= 1
+                j += 1
+            if depth == 0:
+                notes.append(raw[i + 2 : j - 1])
+                out.append(f"@@SN{len(notes)}@@")
+                i = j
+                continue
+        out.append(raw[i])
+        i += 1
+    return "".join(out), notes
+
+
+def render_sidenote_content(text: str) -> str:
+    inner = markdown.markdown(text, extensions=["smarty"]).strip()
+    if inner.startswith("<p>") and inner.endswith("</p>"):
+        inner = inner[3:-4]
+    return inner
+
+
+def inject_sidenotes(body_html: str, notes: list[str]) -> str:
+    for n, content in enumerate(notes, start=1):
+        note_html = render_sidenote_content(content)
+        marker = (
+            f'<span class="sidenote-group" tabindex="0">'
+            f'<label for="sn-{n}" class="sidenote-ref">{n}</label>'
+            f'<input type="checkbox" id="sn-{n}" class="sidenote-toggle">'
+            f'<span class="sidenote">'
+            f'<span class="sidenote-num">{n}</span> {note_html}'
+            f"</span>"
+            f"</span>"
+        )
+        body_html = body_html.replace(f"@@SN{n}@@", marker, 1)
+    return body_html
+
+
+def strip_heading_markers(body_html: str) -> str:
+    """Remove any leading '> ' already typed in markdown heading text."""
+
+    def repl(match: re.Match[str]) -> str:
+        open_tag, content, close_tag = match.group(1), match.group(3), match.group(4)
+        content = re.sub(r"^(\s*(?:&gt;|>)\s*)+", "", content, count=1)
+        return f"{open_tag}{content}{close_tag}"
+
+    return HEADING_RE.sub(repl, body_html)
+
+
+def build_toc(body_html: str) -> str:
+    """TOC from markdown # headings (h1 in rendered HTML)."""
+    h1s = re.findall(r'<h1 id="([^"]+)">([^<]+)</h1>', body_html)
+    if not h1s:
+        return ""
+    items = "\n".join(
+        f'          <li><a href="#{html.escape(id_, quote=True)}">{html.escape(title)}</a></li>'
+        for id_, title in h1s
+    )
+    return f"""      <nav class="post-toc" aria-label="Table of contents">
+        <ul>
+{items}
+        </ul>
+      </nav>
+"""
+
+
+def normalize_list_indent(raw: str) -> str:
+    """Expand 2-space list indents to 4-space for Python-Markdown nesting."""
+    out = []
+    for line in raw.splitlines():
+        m = LIST_LINE_RE.match(line)
+        if m:
+            depth = len(m.group(1)) // 2
+            out.append(" " * (depth * 4) + line.lstrip())
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def slugify(name: str) -> str:
+    s = re.sub(r"[^\w\s-]", "", name.lower()).strip()
+    return re.sub(r"[\s_]+", "-", s)
+
+
+def root_for_depth(depth: int) -> str:
+    """Relative path back to dist/ from a page nested `depth` dirs deep."""
+    return "../" * depth
+
+
+def parse_post(path: Path, section: str) -> dict:
+    """Return {meta, html, slug, ...} for one markdown file."""
+    raw = path.read_text(encoding="utf-8")
+
+    meta = {}
+    m = FRONT_MATTER_RE.match(raw)
+    if m:
+        meta = yaml.safe_load(m.group(1)) or {}
+        raw = raw[m.end() :]
+
+    raw = convert_hex_swatches(convert_wikilinks(normalize_list_indent(raw)))
+    raw, sidenotes = extract_sidenotes(raw)
+
+    md = markdown.Markdown(extensions=MD_EXTENSIONS)
+    body_html = inject_sidenotes(md.convert(raw), sidenotes)
+    body_html = strip_heading_markers(body_html)
+    toc = build_toc(body_html)
+
+    # date: accept a date in front matter, else fall back to file mtime.
+    date = meta.get("date")
+    if isinstance(date, str):
+        date = dt.date.fromisoformat(date)
+    elif isinstance(date, dt.datetime):
+        date = date.date()
+    elif not isinstance(date, dt.date):
+        date = dt.date.fromtimestamp(path.stat().st_mtime)
+
+    title = meta.get("title") or path.stem.replace("-", " ").title()
+    slug = meta.get("slug") or slugify(path.stem)
+
+    # cover image (gallery thumbnail). An explicit front-matter `cover` is also
+    # rendered at the bottom of the post; otherwise we fall back to the first
+    # image in the body for the thumbnail only.
+    cover_file = meta.get("cover")
+    cover_explicit = bool(cover_file)
+    if cover_file:
+        cover = content_image_src(str(cover_file))
+    else:
+        first = FIRST_IMG_RE.search(body_html)
+        cover = first.group(1) if first else None
+
+    return {
+        "title": title,
+        "slug": slug,
+        "date": date,
+        "html": body_html,
+        "toc": toc,
+        "sidenotes": sidenotes,
+        "section": section,
+        "cover": cover,
+        "cover_explicit": cover_explicit,
+    }
+
+
+def render_sidebar(root: str, current_key: str | None) -> str:
+    items = "\n".join(
+        NAV_ITEM.format(
+            root=root,
+            key=s["key"],
+            label=html.escape(s["label"]),
+            active=" active" if s["key"] == current_key else "",
+            current=' aria-current="page"' if s["key"] == current_key else "",
+        )
+        for s in SECTIONS
+    )
+    return SIDEBAR.format(
+        root=root,
+        site_title=html.escape(SITE_TITLE),
+        items=items,
+    )
+
+
+def render_page(
+    title: str, body: str, root: str, *, current_key: str | None = None
+) -> str:
+    page = BASE.format(
+        title=html.escape(title),
+        sidebar=render_sidebar(root, current_key),
+        body=body,
+        root=root,
+    )
+    return page.replace("@@ROOT@@", root)
+
+
+def fmt_date(d: dt.date) -> str:
+    return d.strftime("%B %-d, %Y")
+
+
+def render_landing_sections(root: str) -> str:
+    items = []
+    for s in SECTIONS:
+        items.append(
+            LANDING_SECTION_ICON.format(
+                root=root,
+                key=s["key"],
+                label=html.escape(s["label"]),
+                icon=SECTION_ICONS[s["key"]],
+            )
+        )
+    return f"""        <nav class="landing-sections" aria-label="Sections">
+{chr(10).join(items)}
+        </nav>"""
+
+
+# ---------------------------------------------------------------------------
+# Section renderers
+# ---------------------------------------------------------------------------
+def render_post_page(post: dict, section: dict) -> str:
+    root = root_for_depth(2)
+    layout_class = ""
+    if post["toc"]:
+        layout_class += " has-toc"
+    if post["sidenotes"]:
+        layout_class += " has-sidenotes"
+    content = post["html"]
+    if (
+        post["cover_explicit"]
+        and post["cover"]
+        and post["cover"] not in post["html"]
+    ):
+        content += (
+            f'\n<figure class="post-cover">'
+            f'<img src="{post["cover"]}" alt="{html.escape(post["title"])}" loading="lazy">'
+            f"</figure>"
+        )
+    body = POST_BODY.format(
+        title=html.escape(post["title"]),
+        content=content,
+        toc=post["toc"],
+        date=fmt_date(post["date"]),
+        iso=post["date"].isoformat(),
+        root=root,
+        section=section["key"],
+        section_label=html.escape(section["label"]),
+        layout_class=layout_class,
+        post_class=" has-sidenotes" if post["sidenotes"] else "",
+    )
+    return render_page(post["title"], body, root, current_key=section["key"])
+
+
+def render_list_section(section: dict, posts: list[dict]) -> str:
+    root = root_for_depth(1)
+    items = "\n".join(
+        LIST_ITEM.format(
+            root=root,
+            section=section["key"],
+            slug=p["slug"],
+            title=html.escape(p["title"]),
+            date=fmt_date(p["date"]),
+            iso=p["date"].isoformat(),
+        )
+        for p in posts
+    )
+    body = LIST_BODY.format(
+        label=html.escape(section["label"]),
+        items=items,
+    )
+    return render_page(section["label"], body, root, current_key=section["key"])
+
+
+def render_feed_section(section: dict, posts: list[dict]) -> str:
+    root = root_for_depth(1)
+    items = "\n".join(
+        FEED_ITEM.format(
+            root=root,
+            section=section["key"],
+            slug=p["slug"],
+            title=html.escape(p["title"]),
+            date=fmt_date(p["date"]),
+            iso=p["date"].isoformat(),
+            content=p["html"],
+        )
+        for p in posts
+    )
+    body = FEED_BODY.format(
+        label=html.escape(section["label"]),
+        items=items,
+    )
+    return render_page(section["label"], body, root, current_key=section["key"])
+
+
+def render_gallery_section(section: dict, posts: list[dict]) -> str:
+    root = root_for_depth(1)
+    cards = []
+    for p in posts:
+        if p["cover"]:
+            media = (
+                f'<span class="gallery-card-media">'
+                f'<img src="{p["cover"]}" alt="{html.escape(p["title"])}" loading="lazy">'
+                f"</span>"
+            )
+        else:
+            media = '<span class="gallery-card-media gallery-card-media-empty"></span>'
+        cards.append(
+            GALLERY_CARD.format(
+                root=root,
+                section=section["key"],
+                slug=p["slug"],
+                title=html.escape(p["title"]),
+                media=media,
+            )
+        )
+    body = GALLERY_BODY.format(
+        label=html.escape(section["label"]),
+        cards="\n".join(cards),
+    )
+    return render_page(section["label"], body, root, current_key=section["key"])
+
+
+def list_section_images(section_dir: Path) -> list[Path]:
+    if not section_dir.exists():
+        return []
+    files = [
+        path
+        for path in section_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTS
+    ]
+    return sorted(files, key=lambda path: path.name.lower())
+
+
+def render_images_section(section: dict, images: list[Path]) -> str:
+    root = root_for_depth(1)
+    items = "\n".join(
+        STATIC_GALLERY_ITEM.format(
+            src=urllib.parse.quote(image.name),
+        )
+        for image in images
+    )
+    body = STATIC_GALLERY_BODY.format(
+        label=html.escape(section["label"]),
+        items=items,
+    )
+    return render_page(section["label"], body, root, current_key=section["key"])
+
+
+def render_landing() -> str:
+    root = root_for_depth(0)
+    body = LANDING_BODY.format(
+        intro='<p class="landing-intro">hello world!</p>',
+        sections=render_landing_sections(root),
+    )
+    return render_page(SITE_TITLE, body, root, current_key=None)
+
+
+SECTION_RENDERERS = {
+    "list": render_list_section,
+    "feed": render_feed_section,
+    "gallery": render_gallery_section,
+}
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+def build() -> None:
+    if OUTPUT_DIR.exists():
+        shutil.rmtree(OUTPUT_DIR)
+    OUTPUT_DIR.mkdir(parents=True)
+
+    total = 0
+    for section in SECTIONS:
+        section_dir = CONTENT_DIR / section["key"]
+        if section["kind"] == "images":
+            images = list_section_images(section_dir)
+            section_out = OUTPUT_DIR / section["key"]
+            section_out.mkdir(parents=True, exist_ok=True)
+            for image in images:
+                shutil.copy2(image, section_out / image.name)
+            (section_out / "index.html").write_text(
+                render_images_section(section, images), encoding="utf-8"
+            )
+            continue
+
+        paths = sorted(section_dir.glob("*.md")) if section_dir.exists() else []
+        posts = [parse_post(p, section["key"]) for p in paths]
+        posts.sort(key=lambda p: p["date"], reverse=True)
+        total += len(posts)
+
+        # Per-post pages: dist/<section>/<slug>/index.html
+        for post in posts:
+            out = OUTPUT_DIR / section["key"] / post["slug"]
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "index.html").write_text(
+                render_post_page(post, section), encoding="utf-8"
+            )
+
+        # Section index: dist/<section>/index.html
+        renderer = SECTION_RENDERERS[section["kind"]]
+        section_out = OUTPUT_DIR / section["key"]
+        section_out.mkdir(parents=True, exist_ok=True)
+        (section_out / "index.html").write_text(
+            renderer(section, posts), encoding="utf-8"
+        )
+
+        # Copy any non-markdown assets at the section root.
+        for asset in sorted(section_dir.glob("*")) if section_dir.exists() else []:
+            if asset.is_file() and asset.suffix.lower() != ".md":
+                shutil.copy2(asset, section_out / asset.name)
+
+    # Shared images: content/img/ -> dist/img/
+    img_dir = CONTENT_DIR / "img"
+    if img_dir.is_dir():
+        img_out = OUTPUT_DIR / "img"
+        img_out.mkdir(parents=True, exist_ok=True)
+        for asset in sorted(img_dir.iterdir()):
+            if asset.is_file():
+                shutil.copy2(asset, img_out / asset.name)
+
+    # Landing page: dist/index.html
+    (OUTPUT_DIR / "index.html").write_text(
+        render_landing(), encoding="utf-8"
+    )
+
+    # Static assets.
+    if STATIC_DIR.exists():
+        shutil.copytree(STATIC_DIR, OUTPUT_DIR / "static")
+
+    # GitHub Pages custom domain.
+    if CUSTOM_DOMAIN:
+        (OUTPUT_DIR / "CNAME").write_text(f"{CUSTOM_DOMAIN}\n", encoding="utf-8")
+
+    print(f"Built {total} post(s) across {len(SECTIONS)} section(s) -> {OUTPUT_DIR}/")
+
+
+if __name__ == "__main__":
+    build()
