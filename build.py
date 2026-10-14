@@ -3,14 +3,14 @@
 A minimal static blog generator with sections.
 
 What it does, top to bottom:
-  1. Reads every .md file under CONTENT_DIR/<section>/ (macro, micro, art, burgundy, …).
+  1. Reads every .md file under CONTENT_DIR/<section>/ (macro, micro, tactile, burgundy, …).
   2. Splits off the YAML front matter (the block between the leading --- fences).
   3. Renders the markdown body to HTML.
   4. Writes a page per post           -> dist/<section>/<slug>/index.html
   5. Writes a page per section        -> dist/<section>/index.html
        - macro:   a date-sorted list of essays
        - micro:   a social-media-style feed (title, date, content inline)
-       - art:     a visual gallery grid
+       - tactile:     a visual gallery grid
        - burgundy: a static image gallery (no post pages)
   6. Writes a landing page            -> dist/index.html
   7. Copies everything in static/     -> dist/static/
@@ -52,8 +52,8 @@ SECTIONS = [
         "kind": "feed",
     },
     {
-        "key": "art",
-        "label": "art",
+        "key": "tactile",
+        "label": "tactile",
         "kind": "gallery",
     },
     {
@@ -66,7 +66,7 @@ SECTIONS = [
 SECTION_ICONS = {
     "macro": "macro.png",
     "micro": "micro.png",
-    "art": "art.png",
+    "tactile": "tactile.png",
     "burgundy": "burgundy.png",
 }
 

@@ -16,7 +16,7 @@ rayofsunshine/
 │   ├── img/          # images embedded in posts
 │   ├── macro/        # essays
 │   ├── micro/        # snapshots
-│   ├── art/          # objects
+│   ├── tactile/          # objects
 │   └── burgundy/     # photos
 ├── static/
 │   ├── style.css
