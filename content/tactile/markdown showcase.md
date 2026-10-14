@@ -8,7 +8,7 @@ cover: img/candles.jpg
 
 ![[img/candles.jpg|520]]
 
-The gallery grid on [art](/art/) links here. Gifs work the same way as stills.
+The gallery grid on [tactile](/tactile/) links here. Gifs work the same way as stills.
 
 ![[img/teapot.gif|480]]
 
