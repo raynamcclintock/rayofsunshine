@@ -1,5 +1,5 @@
 ---
-title: I could doom us but not because it will launch the nukes
+title: AI could doom us but not because it will launch the nukes
 date: 2026-10-02
 ---
 

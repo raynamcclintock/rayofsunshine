@@ -1,8 +1,15 @@
 /* Minimal editorial styling. One file. No framework. */
+@font-face {
+	font-family: "MyFont";
+	src: url("static/fonts/moliga-demo.regular.otf") format("opentype");
+	font-weight: normal;
+	font-style: normal;
+	font-display: swap;
+}
 
 :root {
 	--font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
-	--font-serif: "Public Sans", sans-serif;
+  --font-serif: "MyFont", "Public Sans", sans-serif;
 	--ink: #1a1a1a;
 	--muted: #6b6b6b;
 	--rule: #fdfcfa;
