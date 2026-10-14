@@ -1,6 +1,6 @@
 ---
 title: Is it immoral to stop feeling the weight of every bad thing I know about at every moment in time
-date: 2026-10-2
+date: 2026-10-02
 ---
 
 Probably certainly not...
